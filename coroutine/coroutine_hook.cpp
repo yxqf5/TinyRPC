@@ -167,12 +167,22 @@ namespace tinyrpc
 
 
     int connect_hook(int sockfd, const struct sockaddr* addr, socklen_t addrlen){
-        
+	    DebugLog << "this is hook connect";
         if(tinyrpc::Coroutine::IsMainCoroutine()){
+            DebugLog << "hook disable, call sys connect func";
             return g_sys_connect_fun(sockfd, addr, addrlen);
         }
 
+        tinyrpc::Reactor* reactor = tinyrpc::Reactor::GetReactor();
+        assert(reactor != nullptr);
+
         tinyrpc::FdEvent::ptr fd_event = tinyrpc::FdEventContainer::GetFdContainer()->getFdEvent(sockfd);
+        if(fd_event){
+            fd_event->setReactor(reactor);
+        }
+
+        tinyrpc::Coroutine* cur_cor = tinyrpc::Coroutine::GetCurrentCoroutine();
+
 
         fd_event-> setNonBlock();
 
@@ -192,7 +202,15 @@ namespace tinyrpc
 
     	bool is_timeout = false;		// 是否超时
 
-        
+        auto timeout_cb = [&is_timeout, cur_cor](){
+            is_timeout = true;
+            tinyrpc::Coroutine::Resume(cur_cor);
+        };
+
+        // 设置定时器
+        tinyrpc::TimerEvent::ptr event = std::make_shared<tinyrpc::TimerEvent>(gRpcConfig->m_max_connect_timeout, false, timeout_cb);
+        tinyrpc::Timer* timer = reactor->getTimer();
+        timer->addTimerEvent(event);
 
         tinyrpc::Coroutine::Yield();
 
@@ -201,20 +219,104 @@ namespace tinyrpc
         fd_event->delListenEvents(tinyrpc::IOEvent::READ);
         fd_event->clearCoroutine();
 
-        return g_sys_connect_fun(sockfd, addr, addrlen);
+        timer->delTimerEvent(event);
+
+
+        n =  g_sys_connect_fun(sockfd, addr, addrlen);
+        // 这个EISCONN 是什么情况?? 为什么这个情况是链接成功?
+        if((n < 0 && errno == EISCONN) || n ==0 ){
+            DebugLog<< "connect succ";
+            return 0;
+        }
+
+        if(is_timeout){
+        ErrorLog << "connect error,  timeout[ " << gRpcConfig->m_max_connect_timeout << "ms]";
+            errno = ETIMEDOUT;
+	    } 
+
+        DebugLog << "connect error and errno=" << errno <<  ", error=" << strerror(errno);
+
+         return -1;
     }
 
+    unsigned int sleep_hook(unsigned int seconds){
+        DebugLog<<"this is hook sleep";
+        if(tinyrpc::Coroutine::IsMainCoroutine()){
+    DebugLog << "hook disable, call sys sleep func";
+
+            return g_sys_sleep_fun(seconds);
+        }
+
+        tinyrpc::Coroutine* cur_cor = tinyrpc::Coroutine::GetCurrentCoroutine();
+        
+        bool is_timeout = false;
+        auto timeout_cb = [cur_cor,&is_timeout](){
+            DebugLog<< "onTime, now resume sleep cor";
+            is_timeout = true;
+
+            tinyrpc::Coroutine::Resume();
+        };
+
+        tinyrpc::TimerEvent::ptr event = std::make_shared<tinyrpc::TimerEvent>(1000* seconds, false, timeout_cb);
+
+        tinyrpc::Reactor::GetReactor()->getTimer()->addTimerEvent(event);
 
 
+        //这里不太明白,为什么需要将协程Yield放到死循环里?  难道是 防止误唤醒??  可能线程阻塞唤醒时用的方式一样
+        while (!is_timeout)
+        {   
+            tinyrpc::Coroutine::Yield();
+            /* code */
+        }
+        
+        return 0;
+
+    }
+
+    extern "C" {
+
+        int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen){
+            if(!tinyrpc::g_hook){
+                return g_sys_accept_fun(sockfd, addr, addrlen);
+            } else {
+                return tinyrpc::accept_hook(sockfd, addr, addrlen);
+            }
+        }
 
 
+        int read(int sockfd, void* buf, size_t count){
+            if(!tinyrpc::g_hook){
+                return g_sys_read_fun(sockfd, buf, count);
+            } else {
+                return tinyrpc::read_hook(sockfd, buf, count);
+            }
+        }
 
+        int write(int sockfd, const void* buf, size_t count){
+            if(!tinyrpc::g_hook){
+                return g_sys_write_fun(sockfd, buf, count);
+            } else {
+                return tinyrpc::write_hook(sockfd, buf, count);
+            }
+        }
 
+        int connect(int sockfd, struct sockaddr* addr, socklen_t* addrlen){
+            if(!tinyrpc::g_hook){
+                return g_sys_connect_fun(sockfd, addr, addrlen);
+            } else {
+                return tinyrpc::connect_hook(sockfd, addr, addrlen);
+            }
+        }
 
+        int sleep(unsigned int secondes){
+            if(!tinyrpc::g_hook){
+                return g_sys_sleep_fun(secondes);
+            } else {
+                return tinyrpc::sleep_hook(secondes);
+            }
+        }
 
-
-
-
+    }      
 
 
 
